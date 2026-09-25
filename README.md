@@ -1,4 +1,4 @@
-# Munera Task Flow v3
+# Munera Task Flow v1.0.1
 
 Agendador multi-runtime · Node.js ≥ 20 · PostgreSQL · CLI + API HTTP + SSE
 
@@ -33,6 +33,7 @@ Em **outro terminal**, já pode operar:
 ```bash
 munera status
 munera add ./scripts/exemplo.js "11:30,23:30"
+munera add ./scripts/exemplo.php datetime "25/09/2026 02:00" 30
 munera list
 munera run 1
 munera executions 1
@@ -84,7 +85,7 @@ O `sql/001_init.sql` cria 4 tabelas no schema `munera`:
 | Tabela | Finalidade |
 |---|---|
 | `munera.jobs` | Cadastro dos jobs (script, horários, enabled, args/env, timeout) |
-| `munera.job_schedules` | Um registro por `HH:mm` de cada job (contém `next_run_at`) |
+| `munera.job_schedules` | Um registro por `HH:mm` *ou* um registro por `datetime` de cada job (contém `next_run_at`, `datetime` timestamp opcional, `period` varchar em dias opcional) |
 | `munera.executions` | Um registro por execução (status, pid, exit_code, log_path) |
 | `munera.audit` | Log de ações via API (`job.upsert`, `job.run` etc.) |
 
@@ -151,12 +152,13 @@ Todos os comandos (exceto `start` e `--help`) exigem que o serviço já esteja r
 | `munera start` | Inicia API + scheduler (1 por banco via `pg_try_advisory_lock`) |
 | `munera status` / `munera list` | Healthcheck (status) ou lista de jobs (list) |
 | `munera ./scripts/a.js "03:00,15:00"` | **Atalho** para `munera add ./scripts/a.js "03:00,15:00"` |
-| `munera add <script> "HH:mm,HH:mm,..."` | Cria job novo OU acrescenta horários em script existente |
+| `munera add <script> "HH:mm,HH:mm,..."` | Cria job novo OU acrescenta horários em script existente (modo **diário**) |
+| `munera add <script> datetime "DD/MM/YYYY HH:mm" [periodDias]` | Cria/atualiza job em modo **data específica**; `periodDias` opcional faz repetir a cada N dias |
 | `munera run <id>` | Solicita execução manual imediata (respeita `MAX_CONCURRENT`) |
 | `munera cancel <id>` | Cancela execução ativa (mata a árvore de processos) |
 | `munera pause <id>` | Desabilita próximos disparos (não interrompe execução atual) |
 | `munera resume <id>` | Reabilita agendamento |
-| `munera time <id> "06:00,18:00"` | **Substitui** todos os horários do job |
+| `munera time <id> "06:00,18:00"` | **Substitui** todos os horários do job (modo diário) |
 | `munera remove <id>` | Remove job; histórico `executions.job_id` vira NULL |
 | `munera executions [id]` | Últimas execuções (globais ou do job) |
 | `munera log <executionId>` | Imprime o log de uma execução específica |
@@ -168,6 +170,31 @@ Todos os comandos (exceto `start` e `--help`) exigem que o serviço já esteja r
 - `munera time <id> "06:00"` — **apaga** todos os horários do job `<id>` e deixa **apenas** 06:00.
 
 Para rodar o mesmo arquivo com configurações diferentes, crie scripts wrapper (ex: `a-manha.js` e `a-noite.js`), pois `script_path` é único.
+
+### Agendamento em data específica (datetime + period)
+
+O Munera suporta **dois modos** de schedule, que podem coexistir no mesmo job:
+
+| datetime | period | O que acontece |
+|---|---|---|
+| `NULL` | `NULL` | Horário diário tradicional (`HH:mm`, repetindo todo dia) |
+| preenchido | `NULL` | Executa **uma única vez** na data/hora exata; depois o schedule é removido |
+| preenchido | `"30"` | Executa na data/hora inicial e repete **a cada 30 dias** indefinidamente |
+
+Formatos de data/hora aceitos no CLI:
+- `25/09/2026 15:35` · `25-09-2026 15-35` · `25-09-2026 15:35` (data primeiro)
+- `15:35 25/09/2026` · `15-35 25-09-2026` (hora primeiro)
+
+Exemplos:
+```bash
+# Uma única execução em 25/09/2026 às 02:00
+munera add ./backup.php datetime "25/09/2026 02:00"
+
+# A mesma data inicial, repetindo a cada 30 dias
+munera add ./backup.php datetime "25/09/2026 02:00" 30
+```
+
+> Ao usar `datetime`, o campo `times` diário é ignorado para aquele schedule; o job pode ter ambos os tipos (ex: um horário diário 06:00 + uma execução extra no natal).
 
 ---
 
@@ -233,10 +260,15 @@ munera log 1                 # veja a saida
 ## Como funciona o agendamento
 
 - **Tick loop:** a cada `SCHEDULER_POLL_MS` (padrão 1 s), o scheduler consulta `munera.job_schedules` com `next_run_at <= now()` e processa até 100 jobs pendentes.
+- **Dois modos de schedule por job:**
+  - **Diário (`time_hhmm`):** `next_run_at` avança para o **mesmo horário no dia seguinte** (`nextAt`). Vários horários por job são suportados.
+  - **Data específica (`datetime` + `period`):**
+    - `period` = `NULL` → executa **uma vez** e o schedule é **removido** automaticamente após o disparo.
+    - `period` = `"30"` (dias) → executa na data base e avança `next_run_at` somando o período em dias.
 - **Sem catch-up:** disparos vencidos há **mais de 60 s** enquanto o daemon estava fora são pulados (log WARN: "Horário perdido"). Sem replay de dias ausentes.
 - **Sem sobreposição por job:** mesmo `id` não executa em paralelo; horário coincidente vira `skipped` com motivo `already_running_or_capacity`.
 - **Limite global:** `MAX_CONCURRENT` execuções simultâneas; acima disso, novos disparos são `skipped`.
-- **Avança `next_run_at` ANTES de spawnar:** evita reentrega caso o scheduler trave. A próxima execução é imediatamente o próximo dia útil (`nextAt`).
+- **Avança `next_run_at` ANTES de spawnar:** evita reentrega caso o scheduler trave.
 - **Timezone:** `TZ` do `.env` é aplicado no processo Node; cálculo do `HH:mm` considera o horário local do fuso configurado.
 
 ---
@@ -253,10 +285,10 @@ Authorization: Bearer <API_TOKEN do .env>
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/health` | Status + PID + qtde rodando + fuso |
-| `GET` | `/jobs` | Lista jobs + schedules + último status |
-| `POST` | `/jobs` | Cria ou mescla job (mesmo `script` existente). Body: `{ script, times, name?, args?, env?, timeout_seconds? }` |
-| `GET` | `/jobs/:id` | Detalhe do job |
-| `PATCH` | `/jobs/:id` | Atualiza campos: `name`, `times`, `enabled`, `args`, `env`, `timeout_seconds` |
+| `GET` | `/jobs` | Lista jobs + schedules (campos `time`, `datetime`, `period`, `next`) + último status |
+| `POST` | `/jobs` | Cria ou mescla job (mesmo `script` existente). Body: `{ script, times?, name?, args?, env?, timeout_seconds?, datetime?, period? }` |
+| `GET` | `/jobs/:id` | Detalhe do job + schedules |
+| `PATCH` | `/jobs/:id` | Atualiza campos: `name`, `times`, `enabled`, `args`, `env`, `timeout_seconds`, `datetime`, `period` |
 | `DELETE` | `/jobs/:id` | Remove (HTTP 409 se houver execução ativa) |
 | `POST` | `/jobs/:id/run` | Dispara execução manual (HTTP 202 Accepted) |
 | `POST` | `/jobs/:id/cancel` | Cancela execução ativa |
@@ -264,7 +296,7 @@ Authorization: Bearer <API_TOKEN do .env>
 | `GET` | `/executions/:id/log?tail_bytes=16384` | Final do arquivo log em texto |
 | `GET` | `/events` | SSE de eventos ao vivo |
 
-### Exemplo `POST /jobs`
+### Exemplo `POST /jobs` (modo diário)
 
 ```json
 {
@@ -276,6 +308,23 @@ Authorization: Bearer <API_TOKEN do .env>
   "timeout_seconds": 7200
 }
 ```
+
+### Exemplo `POST /jobs` (modo datetime com período)
+
+```json
+{
+  "name": "Backup mensal",
+  "script": "/opt/munera/scripts/backup.sh",
+  "datetime": "2026-09-25T02:00:00.000Z",
+  "period": "30",
+  "timeout_seconds": 14400
+}
+```
+
+Regras:
+- `datetime`: ISO timestamp válido (use `new Date(...).toISOString()`). Quando fornecido, `times` pode ser omitido ou vazio.
+- `period`: string com número inteiro positivo (dias). `NULL` ou omitido = execução única; preenchido = repetição a cada N dias contados de `datetime`.
+- Os dois modos (`times` e `datetime/period`) podem coexistir no mesmo job, gerando schedules independentes.
 
 ### Exemplo com curl / PowerShell
 
@@ -391,6 +440,28 @@ if [ "$DOW" != "1" ]; then
   echo "Nao e segunda, saindo"; exit 0
 fi
 ./gera-relatorio.sh
+```
+
+### 4) Data específica + recorrência mensal
+Use `datetime` + `period` para eventos que não são diários nem semanais (ex: backup mensal, contrato com vencimento):
+
+```bash
+# Uma única vez — data de implantação do novo sistema
+munera add ./jobs/migracao-final.php datetime "15/11/2026 22:00"
+
+# A cada 30 dias, começando em 25/09 às 02:00
+munera add ./jobs/backup-mensal.sh datetime "25/09/2026 02:00" 30
+```
+
+Mesmo via API (ex: integração painel RH para folha todo dia 5):
+```json
+POST /jobs
+{
+  "name": "Folha PG",
+  "script": "D:/munera/jobs/folha.bat",
+  "datetime": "2026-10-05T01:30:00.000Z",
+  "period": "30"
+}
 ```
 
 ---

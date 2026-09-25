@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS munera.job_schedules (
   job_id BIGINT NOT NULL REFERENCES munera.jobs(id) ON DELETE CASCADE,
   time_hhmm CHAR(5) NOT NULL,
   next_run_at TIMESTAMPTZ NOT NULL,
+  datetime TIMESTAMPTZ,
+  period INTEGER,
   PRIMARY KEY(job_id, time_hhmm)
 );
 CREATE INDEX IF NOT EXISTS idx_job_schedules_due ON munera.job_schedules(next_run_at);

@@ -1,2 +1,5 @@
+1.0.1
+- Definição de dias e períodos;
+
 1.0.0
 - Munera first release;

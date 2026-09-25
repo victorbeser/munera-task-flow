@@ -2,24 +2,71 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { cfg } from './config.js';
+
+export function isDateTimeInput(input) {
+  if (typeof input !== 'string') return false;
+  const v = input.trim();
+  return /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(v) && /\d{1,2}[:\-]\d{2}/.test(v);
+}
+
+export function parseDateTime(input) {
+  const v = String(input || '').trim();
+  const patterns = [
+    { re: /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\s+(\d{1,2})[:\-](\d{2})$/, order: ['d', 'm', 'y', 'h', 'mi'] },
+    { re: /^(\d{1,2})[:\-](\d{2})\s+(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/, order: ['h', 'mi', 'd', 'm', 'y'] },
+  ];
+  for (const p of patterns) {
+    const m = p.re.exec(v);
+    if (m) {
+      const parts = {};
+      p.order.forEach((k, i) => { parts[k] = parseInt(m[i + 1], 10); });
+      let year = parts.y;
+      if (year < 100) year += 2000;
+      const d = new Date(year, parts.m - 1, parts.d, parts.h, parts.mi, 0, 0);
+      if (isNaN(d.getTime())) continue;
+      if (d.getDate() !== parts.d || d.getMonth() !== parts.m - 1 || d.getFullYear() !== year) continue;
+      if (d.getHours() !== parts.h || d.getMinutes() !== parts.mi) continue;
+      return d;
+    }
+  }
+  throw new Error(`Data/hora inválida: ${v}. Formatos aceitos: DD/MM/YYYY HH:mm, DD-MM-YYYY HH:mm, HH:mm DD/MM/YYYY`);
+}
+
 export function times(input) {
   const items = Array.isArray(input) ? input : String(input || '').split(',');
   const out = new Set();
   for (const raw of items) {
     const v = String(raw).trim();
+    if (isDateTimeInput(v)) continue;
     const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(v);
     if (!m) throw new Error(`Horário inválido: ${v}. Use HH:mm`);
     out.add(`${m[1].padStart(2, '0')}:${m[2]}`);
   }
-  if (!out.size) throw new Error('Informe ao menos um horário');
   return [...out].sort();
 }
+
 export function nextAt(time, from = new Date()) {
-  // TZ é definida ANTES da inicialização pelo .env e usada pelo Node nos cálculos locais.
   const [hh, mm] = time.split(':').map(Number);
   const next = new Date(from);
   next.setHours(hh, mm, 0, 0);
   if (next <= from) next.setDate(next.getDate() + 1);
+  return next;
+}
+
+export function nextAtDateTime(dateTime, periodDays, from = new Date()) {
+  const base = new Date(dateTime);
+  if (isNaN(base.getTime())) throw new Error('Datetime inválido');
+  if (periodDays == null) {
+    return base;
+  }
+  const period = Number(periodDays);
+  if (!Number.isInteger(period) || period <= 0) throw new Error('period deve ser inteiro positivo (dias)');
+  if (base > from) return base;
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const diffMs = from.getTime() - base.getTime();
+  const diffDays = Math.floor(diffMs / msPerDay);
+  const cycles = Math.floor(diffDays / period) + 1;
+  const next = new Date(base.getTime() + cycles * period * msPerDay);
   return next;
 }
 export function resolveScript(input) {

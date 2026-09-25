@@ -7,6 +7,7 @@ import { pool, setupGlobalErrorHandlers } from './src/db.js';
 import { createApi } from './src/api.js';
 import { startScheduler, stopScheduler } from './src/service.js';
 import { shutdownRuns } from './src/runner.js';
+import { parseDateTime, isDateTimeInput } from './src/util.js';
 
 setupGlobalErrorHandlers();
 
@@ -419,18 +420,42 @@ function printMuneraBanner() {
 
 const HELP = `
 Munera v3 — Node.js + PostgreSQL + API + SSE
-  munera start
-  munera add ./scripts/a.js "03:00,15:00"
-  munera ./scripts/a.php "04:00"                 (atalho para add)
-  munera list | status
-  munera run <id> | cancel <id>
-  munera pause <id> | resume <id>
-  munera time <id> "03:00,15:00"
-  munera remove <id>
-  munera executions [id]
-  munera log <executionId>
-  munera events
-  munera --help
+
+  Controle do daemon
+    munera start                          Inicia daemon em segundo plano
+    munera serve                          Executa daemon no terminal (foreground)
+    munera status                         Status do daemon (PID / ativos / desde)
+    munera events                         Stream SSE ao vivo de eventos
+
+  Cadastro de tarefas
+    munera add ./script "HH:mm[, HH:mm]"           Horário(s) diário(s)
+    munera ./scripts/teste.js "23:30"              Atalho para add
+
+    munera add ./script datetime "DD/MM/YYYY HH:mm" [periodDias]
+      Executa uma única vez na data/hora informada.
+      Se periodDias for informado, repete a cada N dias a contar dessa data.
+
+      Formatos de data/hora aceitos:
+        25/09/2026 15:35      25-09-2026 15-35      25-09-2026 15:35
+        15:35 25/09/2026      15-35 25-09-2026
+
+      Exemplos:
+        munera add ./backup.php datetime "25/09/2026 02:00"       (uma vez)
+        munera add ./backup.php datetime "25/09/2026 02:00" 30    (a cada 30 dias)
+
+  Gerenciamento
+    munera list                           Lista tarefas cadastradas
+    munera run <id>                       Executa imediatamente
+    munera cancel <id>                    Cancela execução em andamento
+    munera pause <id>                     Pausa agendamento
+    munera resume <id>                    Reativa agendamento
+    munera time <id> "08:00, 18:00"       Substitui horários
+    munera remove <id>                    Remove cadastro
+    munera executions [id]                Lista execuções (opcionalmente por job)
+    munera log <executionId>              Exibe último log da execução
+
+  Outros
+    munera --help                         Esta ajuda
 
 Scripts permitidos: .js .mjs .cjs .php .ps1 .sh .bat .cmd (bat/cmd somente Windows).
 Apenas scripts dentro de SCRIPT_ROOTS podem ser cadastrados.
@@ -517,10 +542,27 @@ async function main() {
   if (cmd === 'status') result = await api('GET', '/health');
   else if (cmd === 'list') result = await api('GET', '/jobs');
   else if (cmd === 'add' || /\.(js|mjs|cjs|php|ps1|sh|bat|cmd)$/i.test(cmd)) {
-    const script = cmd === 'add' ? rest[0] : cmd;
-    const schedule = cmd === 'add' ? rest[1] : rest[0];
-    if (!script || !schedule) throw new Error('Uso: munera add ./scripts/a.js "03:00,15:00"');
-    result = await api('POST', '/jobs', { script: path.resolve(script), times: schedule });
+    const isAdd = cmd === 'add';
+    const script = isAdd ? rest[0] : cmd;
+    let payload;
+    if (isAdd && rest[1] && String(rest[1]).toLowerCase() === 'datetime') {
+      const rawDateTime = rest[2];
+      const period = rest[3];
+      if (!script || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php datetime "25/09/2026 15:35" [period]');
+      const dt = parseDateTime(rawDateTime);
+      payload = { script: path.resolve(script), datetime: dt.toISOString(), period: period ? String(period) : null, times: '' };
+    } else {
+      const schedule = isAdd ? rest[1] : rest[0];
+      if (!script || !schedule) throw new Error('Uso: munera add ./scripts/a.js "03:00,15:00"');
+      const hasDT = String(schedule).split(',').some(x => isDateTimeInput(x));
+      if (hasDT) {
+        const dt = parseDateTime(String(schedule).split(',')[0]);
+        payload = { script: path.resolve(script), datetime: dt.toISOString(), period: null, times: '' };
+      } else {
+        payload = { script: path.resolve(script), times: schedule };
+      }
+    }
+    result = await api('POST', '/jobs', payload);
   } else if (cmd === 'run' || cmd === 'cancel') result = await api('POST', `/jobs/${requireId(rest[0])}/${cmd}`);
   else if (cmd === 'pause' || cmd === 'resume') result = await api('PATCH', `/jobs/${requireId(rest[0])}`, { enabled: cmd === 'resume' });
   else if (cmd === 'time') result = await api('PATCH', `/jobs/${requireId(rest[0])}`, { times: rest[1] });

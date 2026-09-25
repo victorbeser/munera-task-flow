@@ -1,7 +1,7 @@
 /** Scheduler: um único dono do lock PostgreSQL, horários persistidos por job. */
 import { cfg, log } from './config.js';
 import { pool, query, transaction, audit, attachClientErrorHandler } from './db.js';
-import { times, nextAt, resolveScript, validateArgs, validateEnv } from './runtime.js';
+import { times, nextAt, nextAtDateTime, resolveScript, validateArgs, validateEnv, parseDateTime } from './runtime.js';
 import { run, isRunning, activeCount, emit } from './runner.js';
 
 
@@ -94,22 +94,37 @@ async function tick() {
       log(`[LOCK] heartbeat falhou: ${heartbeatErr.message}. Disparando reconexão...`, 'ERROR');
       throw heartbeatErr;
     }
-    const due = await query(`SELECT s.job_id,s.time_hhmm,j.* FROM munera.job_schedules s
+    const due = await query(`SELECT s.job_id,s.time_hhmm,s.datetime,s.period,j.* FROM munera.job_schedules s
       JOIN munera.jobs j ON j.id=s.job_id WHERE j.enabled=true AND s.next_run_at <= now()
       ORDER BY s.next_run_at LIMIT 100`);
     for (const row of due.rows) {
-      const next = nextAt(row.time_hhmm);
-      await query('UPDATE munera.job_schedules SET next_run_at=$1 WHERE job_id=$2 AND time_hhmm=$3',
-        [next, row.job_id, row.time_hhmm]);
+      let triggerLabel;
+      if (row.datetime) {
+        triggerLabel = `datetime ${new Date(row.datetime).toLocaleString()}`;
+        if (row.period) {
+          triggerLabel += ` period=${row.period}d`;
+          const next = nextAtDateTime(row.datetime, row.period);
+          await query('UPDATE munera.job_schedules SET next_run_at=$1 WHERE job_id=$2 AND datetime=$3',
+            [next, row.job_id, row.datetime]);
+        } else {
+          await query('DELETE FROM munera.job_schedules WHERE job_id=$1 AND datetime=$2',
+            [row.job_id, row.datetime]);
+        }
+      } else {
+        triggerLabel = `schedule ${row.time_hhmm}`;
+        const next = nextAt(row.time_hhmm);
+        await query('UPDATE munera.job_schedules SET next_run_at=$1 WHERE job_id=$2 AND time_hhmm=$3',
+          [next, row.job_id, row.time_hhmm]);
+      }
       if (isRunning(row.job_id) || activeCount() >= cfg.maxConcurrent) {
-        log(`[${row.name}] IGNORADO ${row.time_hhmm}: sobreposição ou limite de concorrência`, 'WARN');
+        log(`[${row.name}] IGNORADO ${triggerLabel}: sobreposição ou limite de concorrência`, 'WARN');
         await query(`INSERT INTO munera.executions(job_id,job_name,script_path,trigger,status,finished_at,error_message)
           VALUES($1,$2,$3,$4,'skipped',now(),$5)`,
-          [row.job_id, row.name, row.script_path, `schedule ${row.time_hhmm}`, 'already_running_or_capacity']);
-        emit('execution.skipped', { jobId: Number(row.job_id), time: row.time_hhmm });
+          [row.job_id, row.name, row.script_path, triggerLabel, 'already_running_or_capacity']);
+        emit('execution.skipped', { jobId: Number(row.job_id), time: row.time_hhmm, datetime: row.datetime });
         continue;
       }
-      void run(row, `schedule ${row.time_hhmm}`).catch(e => log(`[RUN ${row.name}] ${e.message}`, 'ERROR'));
+      void run(row, triggerLabel).catch(e => log(`[RUN ${row.name}] ${e.message}`, 'ERROR'));
     }
   } catch (tickErr) {
     log(`SCHEDULER tick: ${tickErr.message}`, 'ERROR');
@@ -120,14 +135,18 @@ async function tick() {
   } finally { busy = false; }
 }
 export async function listJobs() {
-  const result = await query(`SELECT j.*, COALESCE((SELECT json_agg(json_build_object('time',time_hhmm,'next',next_run_at)
-    ORDER BY time_hhmm) FROM munera.job_schedules WHERE job_id=j.id),'[]'::json) AS schedules,
+  const result = await query(`SELECT j.*, COALESCE((SELECT json_agg(json_build_object(
+      'time',time_hhmm,'next',next_run_at,'datetime',datetime,'period',period)
+    ORDER BY COALESCE(datetime, make_date(1970,1,1) + time_hhmm::interval)) FROM munera.job_schedules WHERE job_id=j.id),'[]'::json) AS schedules,
     (SELECT status FROM munera.executions e WHERE e.job_id=j.id ORDER BY id DESC LIMIT 1) AS last_status
     FROM munera.jobs j ORDER BY j.id`);
   return result.rows.map(row => ({ ...row, running: isRunning(row.id) }));
 }
 export async function getJob(id) {
-  const result = await query('SELECT * FROM munera.jobs WHERE id=$1', [id]);
+  const result = await query(`SELECT j.*, COALESCE((SELECT json_agg(json_build_object(
+      'time',time_hhmm,'next',next_run_at,'datetime',datetime,'period',period)
+    ORDER BY COALESCE(datetime, make_date(1970,1,1) + time_hhmm::interval)) FROM munera.job_schedules WHERE job_id=j.id),'[]'::json) AS schedules
+    FROM munera.jobs j WHERE j.id=$1`, [id]);
   if (!result.rows.length) throw Object.assign(new Error('Tarefa não encontrada'), { status: 404 });
   return result.rows[0];
 }
@@ -135,7 +154,23 @@ export async function addJob(body) {
   const script = resolveScript(body.script);
   const name = String(body.name || script.split(/[\\/]/).pop().replace(/\.[^.]+$/, '')).slice(0, 150);
   if (!name) throw new Error('Nome obrigatório');
-  const schedule = times(body.times);
+  const hasDateTime = body.datetime != null && body.datetime !== '';
+  let dateTimeValue = null;
+  let periodValue = null;
+  if (hasDateTime) {
+    try {
+      dateTimeValue = new Date(body.datetime);
+      if (isNaN(dateTimeValue.getTime())) throw new Error('');
+    } catch {
+      throw new Error('datetime inválido');
+    }
+    if (body.period != null && body.period !== '' && body.period !== null) {
+      periodValue = String(body.period);
+      const p = Number(periodValue);
+      if (!Number.isInteger(p) || p <= 0) throw new Error('period deve ser inteiro positivo (dias)');
+    }
+  }
+  const schedule = hasDateTime ? [] : times(body.times);
   const args = validateArgs(body.args || []), env = validateEnv(body.env || {});
   const timeout = body.timeout_seconds ?? cfg.timeout;
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 86400) throw new Error('timeout_seconds inválido');
@@ -156,15 +191,37 @@ export async function addJob(body) {
     }
     for (const time of schedule) await client.query(`INSERT INTO munera.job_schedules(job_id,time_hhmm,next_run_at)
       VALUES($1,$2,$3) ON CONFLICT(job_id,time_hhmm) DO NOTHING`, [id, time, nextAt(time)]);
+    if (hasDateTime) {
+      const next = nextAtDateTime(dateTimeValue, periodValue);
+      await client.query(`INSERT INTO munera.job_schedules(job_id,time_hhmm,datetime,period,next_run_at)
+        VALUES($1,NULL,$2,$3,$4)`, [id, dateTimeValue, periodValue, next]);
+    }
     return id;
   });
-  await audit('job.upsert', job, { script, schedule });
+  await audit('job.upsert', job, { script, schedule, datetime: dateTimeValue, period: periodValue });
   emit('job.changed', { jobId: Number(job) });
   return getJob(job);
 }
 export async function updateJob(id, body) {
   const original = await getJob(id);
-  const schedule = body.times === undefined ? original.times : times(body.times);
+  const hasDateTime = body.datetime !== undefined ? (body.datetime != null && body.datetime !== '') : null;
+  let dateTimeValue = null;
+  let periodValue = null;
+  if (hasDateTime === true) {
+    try {
+      dateTimeValue = new Date(body.datetime);
+      if (isNaN(dateTimeValue.getTime())) throw new Error('');
+    } catch {
+      throw new Error('datetime inválido');
+    }
+    const periodIn = body.period !== undefined ? body.period : null;
+    if (periodIn != null && periodIn !== '') {
+      periodValue = String(periodIn);
+      const p = Number(periodValue);
+      if (!Number.isInteger(p) || p <= 0) throw new Error('period deve ser inteiro positivo (dias)');
+    }
+  }
+  const schedule = hasDateTime === true ? [] : (body.times === undefined ? original.times : times(body.times));
   const name = body.name === undefined ? original.name : String(body.name).trim().slice(0, 150);
   const args = body.args === undefined ? original.args : validateArgs(body.args);
   const env = body.env === undefined ? original.env : validateEnv(body.env);
@@ -176,10 +233,16 @@ export async function updateJob(id, body) {
     await client.query(`UPDATE munera.jobs SET name=$1,args=$2::jsonb,env=$3::jsonb,times=$4,
       enabled=$5,timeout_seconds=$6,updated_at=now() WHERE id=$7`,
       [name, JSON.stringify(args), JSON.stringify(env), schedule, enabled, timeout, id]);
-    if (body.times !== undefined) {
+    const resetSchedules = body.times !== undefined || hasDateTime !== null;
+    if (resetSchedules) {
       await client.query('DELETE FROM munera.job_schedules WHERE job_id=$1', [id]);
       for (const time of schedule) await client.query(`INSERT INTO munera.job_schedules(job_id,time_hhmm,next_run_at)
         VALUES($1,$2,$3)`, [id, time, nextAt(time)]);
+      if (hasDateTime === true) {
+        const next = nextAtDateTime(dateTimeValue, periodValue);
+        await client.query(`INSERT INTO munera.job_schedules(job_id,time_hhmm,datetime,period,next_run_at)
+          VALUES($1,NULL,$2,$3,$4)`, [id, dateTimeValue, periodValue, next]);
+      }
     }
   });
   await audit('job.update', id, { fields: Object.keys(body) });

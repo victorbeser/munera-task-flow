@@ -4,32 +4,49 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { config, ROOT } from './config.js';
-import { parseTimes, resolveScript } from './util.js';
+import { cfg as config, ROOT } from './config.js';
+import { parseTimes, resolveScript, parseDateTime, isDateTimeInput } from './util.js';
 const DAEMON_LOG = path.join(config.logDir, 'daemon.log');
 
 function help() {
   console.log(`
 MUNERA v3 — PostgreSQL + scripts Node/PHP/BAT/PowerShell/SH
 
-  munera start                          Inicia daemon em segundo plano
-  munera serve                          Executa daemon no terminal
-  munera status                         Status do daemon
-  munera add ./scripts/teste.php "03:00, 15:00"
-  munera ./scripts/teste.js "23:30"     Atalho para add
-  munera list                           Lista tarefas
-  munera run <id>                       Executa imediatamente
-  munera pause <id>                     Pausa agendamento
-  munera resume <id>                    Reativa agendamento
-  munera time <id> "08:00, 18:00"       Substitui horários
-  munera timeout <id> 1800              Timeout em segundos
-  munera history <id>                   Últimas 20 execuções
-  munera logs <id>                      Mostra caminho do último log
-  munera remove <id>                    Remove cadastro
-  munera stop                           Encerra daemon
+  Controle do daemon
+    munera start                          Inicia daemon em segundo plano
+    munera serve                          Executa daemon no terminal (foreground)
+    munera status                         Status do daemon (PID / ativos / desde)
+    munera stop                           Encerra daemon
+
+  Cadastro de tarefas
+    munera add ./script "HH:mm[, HH:mm]"           Horário(s) diário(s)
+    munera ./scripts/teste.js "23:30"              Atalho para add
+
+    munera add ./script datetime "DD/MM/YYYY HH:mm" [periodDias]
+      Executa uma única vez na data/hora informada.
+      Se periodDias for informado, repete a cada N dias a contar dessa data.
+
+      Formatos de data/hora aceitos:
+        25/09/2026 15:35      25-09-2026 15-35      25-09-2026 15:35
+        15:35 25/09/2026      15-35 25-09-2026
+
+      Exemplos:
+        munera add ./backup.php datetime "25/09/2026 02:00"       (uma vez)
+        munera add ./backup.php datetime "25/09/2026 02:00" 30    (a cada 30 dias)
+
+  Gerenciamento
+    munera list                           Lista tarefas cadastradas
+    munera run <id>                       Executa imediatamente
+    munera pause <id>                     Pausa agendamento
+    munera resume <id>                    Reativa agendamento
+    munera time <id> "08:00, 18:00"       Substitui horários
+    munera timeout <id> 1800              Timeout em segundos (1..86400)
+    munera history <id>                   Últimas 20 execuções
+    munera logs <id>                      Caminho do último log
+    munera remove <id>                    Remove cadastro
 
   Configuração: ${path.join(ROOT,'.env')}
-  Logs: ${config.logDir}
+  Logs:        ${config.logDir}
 `);
 }
 async function request(method, route, data) {
@@ -83,18 +100,53 @@ export async function cli(args) {
     if (!jobs.length) return console.log('[MUNERA] Nenhuma tarefa');
     for (const job of jobs) {
       console.log(`\n[${job.id}] ${job.name} | ${job.enabled?'ATIVO':'PAUSADO'} | ${job.running?'EXECUTANDO PID='+job.pid:'AGUARDANDO'}`);
-      console.log(`  script: ${job.script}\n  horários: ${job.times.join(', ')}\n  timeout: ${job.timeoutSeconds}s`);
-      for (const next of job.nextRuns) console.log(`  próxima ${next.time}: ${new Date(next.at).toLocaleString()}`);
+      console.log(`  script: ${job.script}\n  timeout: ${job.timeoutSeconds}s`);
+      if (job.times && job.times.length) console.log(`  horários: ${job.times.join(', ')}`);
+      if (job.schedules) for (const s of job.schedules) {
+        if (s.datetime) {
+          const line = `  data: ${new Date(s.datetime).toLocaleString()}` + (s.period ? ` | período: ${s.period} dias` : '') + ` | próxima: ${new Date(s.next).toLocaleString()}`;
+          console.log(line);
+        } else if (s.time) {
+          console.log(`  horário ${s.time}: ${new Date(s.next).toLocaleString()}`);
+        }
+      }
     }
     return;
   }
   if (command==='add' || (!['run','pause','resume','time','timeout','history','logs','remove','serve'].includes(command) && !command.startsWith('-'))) {
-    const scriptInput = command==='add'?first:command;
-    const rawTimes = command==='add'?second:first;
-    if (!scriptInput || !rawTimes) throw new Error('Uso: munera add ./scripts/a.php "03:00, 15:00"');
-    const script = resolveScript(scriptInput);
-    const {job}=await request('POST','/jobs',{script,times:parseTimes(rawTimes).join(',')});
-    return console.log(`[MUNERA] CADASTRADO ${job.id} ${job.script} horários=${job.times.join(',')}`);
+    const isAdd = command==='add';
+    const scriptInput = isAdd ? first : command;
+    let body;
+    if (isAdd && second && String(second).toLowerCase() === 'datetime') {
+      const rawDateTime = args[3];
+      const period = args[4];
+      if (!scriptInput || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php datetime "25/09/2026 15:35" [period]');
+      const script = resolveScript(scriptInput);
+      const dt = parseDateTime(rawDateTime);
+      body = { script, datetime: dt.toISOString(), period: period ? String(period) : null, times: '' };
+    } else {
+      const rawTimes = isAdd ? second : first;
+      if (!scriptInput || !rawTimes) throw new Error('Uso: munera add ./scripts/a.php "03:00, 15:00"');
+      const script = resolveScript(scriptInput);
+      const hasDT = String(rawTimes).split(',').some(x => isDateTimeInput(x));
+      if (hasDT) {
+        const dt = parseDateTime(String(rawTimes).split(',')[0]);
+        body = { script, datetime: dt.toISOString(), period: null, times: '' };
+      } else {
+        body = { script, times: parseTimes(rawTimes).join(',') };
+      }
+    }
+    const {job}=await request('POST','/jobs',body);
+    const extra = [];
+    if (job.times && job.times.length) extra.push(`horários=${job.times.join(',')}`);
+    if (job.schedules) {
+      const s = job.schedules.find(x => x.datetime);
+      if (s) {
+        extra.push(`datetime=${new Date(s.datetime).toLocaleString()}`);
+        if (s.period) extra.push(`period=${s.period}dias`);
+      }
+    }
+    return console.log(`[MUNERA] CADASTRADO ${job.id} ${job.script} ${extra.join(' ')}`);
   }
   if (!first && command!=='serve') throw new Error(`Informe o ID: munera ${command} <id>`);
   const route=`/jobs/${encodeURIComponent(first)}`;
