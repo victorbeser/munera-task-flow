@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { cfg as config, ROOT } from './config.js';
 import { parseTimes, resolveScript, parseDateTime, isDateTimeInput } from './util.js';
 const DAEMON_LOG = path.join(config.logDir, 'daemon.log');
+const muneraVersion = "1.0.2";
 
 function help() {
   console.log(`
@@ -22,6 +23,7 @@ MUNERA v3 — PostgreSQL + scripts Node/PHP/BAT/PowerShell/SH
     munera add ./script "HH:mm[, HH:mm]"           Horário(s) diário(s)
     munera ./scripts/teste.js "23:30"              Atalho para add
 
+    munera add ./script alias "Nome Amigável" "HH:mm[, HH:mm]"
     munera add ./script datetime "DD/MM/YYYY HH:mm" [periodDias]
       Executa uma única vez na data/hora informada.
       Se periodDias for informado, repete a cada N dias a contar dessa data.
@@ -31,6 +33,7 @@ MUNERA v3 — PostgreSQL + scripts Node/PHP/BAT/PowerShell/SH
         15:35 25/09/2026      15-35 25-09-2026
 
       Exemplos:
+        munera add ./backup.php alias "Backup Banco" datetime "25/09/2026 02:00" 30
         munera add ./backup.php datetime "25/09/2026 02:00"       (uma vez)
         munera add ./backup.php datetime "25/09/2026 02:00" 30    (a cada 30 dias)
 
@@ -44,6 +47,8 @@ MUNERA v3 — PostgreSQL + scripts Node/PHP/BAT/PowerShell/SH
     munera history <id>                   Últimas 20 execuções
     munera logs <id>                      Caminho do último log
     munera remove <id>                    Remove cadastro
+    munera version                        Versão do Munera
+
 
   Configuração: ${path.join(ROOT,'.env')}
   Logs:        ${config.logDir}
@@ -85,6 +90,7 @@ async function start() {
 export async function cli(args) {
   const [command,first,second] = args;
   if (!command || ['help','--help','-h'].includes(command)) return help();
+  if (command==='version') return console.log(muneraVersion);
   if (command==='start') return start();
   if (command==='status') {
     const health = await online();
@@ -116,17 +122,22 @@ export async function cli(args) {
   if (command==='add' || (!['run','pause','resume','time','timeout','history','logs','remove','serve'].includes(command) && !command.startsWith('-'))) {
     const isAdd = command==='add';
     const scriptInput = isAdd ? first : command;
+    const tail = isAdd ? args.slice(2) : args.slice(1);
+    const aliasIdx = tail.findIndex(a => String(a).toLowerCase() === 'alias');
+    const alias = aliasIdx !== -1 ? tail[aliasIdx + 1] : null;
+    const rest = aliasIdx !== -1 ? tail.slice(0, aliasIdx).concat(tail.slice(aliasIdx + 2)) : tail;
     let body;
-    if (isAdd && second && String(second).toLowerCase() === 'datetime') {
-      const rawDateTime = args[3];
-      const period = args[4];
-      if (!scriptInput || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php datetime "25/09/2026 15:35" [period]');
+    if (isAdd && rest[0] && String(rest[0]).toLowerCase() === 'datetime') {
+      const rawDateTime = rest[1];
+      const period = rest[2];
+      if (!scriptInput || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php [alias "Nome"] datetime "25/09/2026 15:35" [period]');
       const script = resolveScript(scriptInput);
       const dt = parseDateTime(rawDateTime);
       body = { script, datetime: dt.toISOString(), period: period ? String(period) : null, times: '' };
+      if (alias) body.name = alias;
     } else {
-      const rawTimes = isAdd ? second : first;
-      if (!scriptInput || !rawTimes) throw new Error('Uso: munera add ./scripts/a.php "03:00, 15:00"');
+      const rawTimes = rest[0];
+      if (!scriptInput || !rawTimes) throw new Error('Uso: munera add ./scripts/a.php [alias "Nome"] "03:00, 15:00"');
       const script = resolveScript(scriptInput);
       const hasDT = String(rawTimes).split(',').some(x => isDateTimeInput(x));
       if (hasDT) {
@@ -135,9 +146,11 @@ export async function cli(args) {
       } else {
         body = { script, times: parseTimes(rawTimes).join(',') };
       }
+      if (alias) body.name = alias;
     }
     const {job}=await request('POST','/jobs',body);
     const extra = [];
+    if (job.name && job.name !== path.basename(job.script, path.extname(job.script))) extra.push(`nome="${job.name}"`);
     if (job.times && job.times.length) extra.push(`horários=${job.times.join(',')}`);
     if (job.schedules) {
       const s = job.schedules.find(x => x.datetime);

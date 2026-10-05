@@ -1,3 +1,7 @@
+1.0.2
+- Adição de alias;
+- Version command CLI;
+
 1.0.1
 - Definição de dias e períodos;
 

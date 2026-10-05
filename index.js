@@ -9,6 +9,8 @@ import { startScheduler, stopScheduler } from './src/service.js';
 import { shutdownRuns } from './src/runner.js';
 import { parseDateTime, isDateTimeInput } from './src/util.js';
 
+const MUNERA_VERSION = 'v1.0.2';
+
 setupGlobalErrorHandlers();
 
 /* ============================================================
@@ -431,6 +433,7 @@ Munera v3 — Node.js + PostgreSQL + API + SSE
     munera add ./script "HH:mm[, HH:mm]"           Horário(s) diário(s)
     munera ./scripts/teste.js "23:30"              Atalho para add
 
+    munera add ./script alias "Nome Amigável" "HH:mm[, HH:mm]"
     munera add ./script datetime "DD/MM/YYYY HH:mm" [periodDias]
       Executa uma única vez na data/hora informada.
       Se periodDias for informado, repete a cada N dias a contar dessa data.
@@ -440,6 +443,7 @@ Munera v3 — Node.js + PostgreSQL + API + SSE
         15:35 25/09/2026      15-35 25-09-2026
 
       Exemplos:
+        munera add ./backup.php alias "Backup Banco" datetime "25/09/2026 02:00" 30
         munera add ./backup.php datetime "25/09/2026 02:00"       (uma vez)
         munera add ./backup.php datetime "25/09/2026 02:00" 30    (a cada 30 dias)
 
@@ -453,8 +457,10 @@ Munera v3 — Node.js + PostgreSQL + API + SSE
     munera remove <id>                    Remove cadastro
     munera executions [id]                Lista execuções (opcionalmente por job)
     munera log <executionId>              Exibe último log da execução
+    munera version                        Versão do Munera
 
   Outros
+    munera version | --version | -v       Versão do Munera
     munera --help                         Esta ajuda
 
 Scripts permitidos: .js .mjs .cjs .php .ps1 .sh .bat .cmd (bat/cmd somente Windows).
@@ -529,6 +535,7 @@ async function serve() {
 }
 async function main() {
   if (!args.length || args[0] === '--help' || args[0] === '-h') { console.log(HELP); return; }
+  if (args[0] === 'version' || args[0] === '--version' || args[0] === '-v') { console.log(MUNERA_VERSION); return; }
   validateConfig();
   const [cmd, ...rest] = args;
   if (cmd === 'start') return serve();
@@ -544,16 +551,23 @@ async function main() {
   else if (cmd === 'add' || /\.(js|mjs|cjs|php|ps1|sh|bat|cmd)$/i.test(cmd)) {
     const isAdd = cmd === 'add';
     const script = isAdd ? rest[0] : cmd;
+    const scheduleTail = isAdd ? rest.slice(1) : rest.slice(0);
+    const aliasIdx = scheduleTail.findIndex(a => String(a).toLowerCase() === 'alias');
+    const alias = aliasIdx !== -1 ? scheduleTail[aliasIdx + 1] : null;
+    const clean = aliasIdx !== -1
+      ? scheduleTail.slice(0, aliasIdx).concat(scheduleTail.slice(aliasIdx + 2))
+      : scheduleTail;
     let payload;
-    if (isAdd && rest[1] && String(rest[1]).toLowerCase() === 'datetime') {
-      const rawDateTime = rest[2];
-      const period = rest[3];
-      if (!script || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php datetime "25/09/2026 15:35" [period]');
+    if (isAdd && clean[0] && String(clean[0]).toLowerCase() === 'datetime') {
+      const rawDateTime = clean[1];
+      const period = clean[2];
+      if (!script || !rawDateTime) throw new Error('Uso: munera add ./scripts/a.php [alias "Nome"] datetime "25/09/2026 15:35" [period]');
       const dt = parseDateTime(rawDateTime);
       payload = { script: path.resolve(script), datetime: dt.toISOString(), period: period ? String(period) : null, times: '' };
+      if (alias) payload.name = alias;
     } else {
-      const schedule = isAdd ? rest[1] : rest[0];
-      if (!script || !schedule) throw new Error('Uso: munera add ./scripts/a.js "03:00,15:00"');
+      const schedule = clean[0];
+      if (!script || !schedule) throw new Error('Uso: munera add ./scripts/a.js [alias "Nome"] "03:00,15:00"');
       const hasDT = String(schedule).split(',').some(x => isDateTimeInput(x));
       if (hasDT) {
         const dt = parseDateTime(String(schedule).split(',')[0]);
@@ -561,6 +575,7 @@ async function main() {
       } else {
         payload = { script: path.resolve(script), times: schedule };
       }
+      if (alias) payload.name = alias;
     }
     result = await api('POST', '/jobs', payload);
   } else if (cmd === 'run' || cmd === 'cancel') result = await api('POST', `/jobs/${requireId(rest[0])}/${cmd}`);
